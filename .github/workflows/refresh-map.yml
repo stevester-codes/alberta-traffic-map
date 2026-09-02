@@ -1,0 +1,95 @@
+name: Refresh Alberta traffic map
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/refresh-map.yml'
+  workflow_dispatch:
+  schedule:
+    - cron: '17 10 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build current map
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # One-time migration of the current working viewer into this dedicated repo.
+          if [ ! -f index.html ]; then
+            curl -fL --retry 4 'https://raw.githubusercontent.com/stevester-codes/moonlight-tizen/alberta-traffic-map/alberta-traffic-map/v3.html' -o index.html
+          fi
+
+          # Vendor Leaflet locally so the viewer does not depend on a JS/CSS CDN.
+          curl -fL --retry 4 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css' -o leaflet.css
+          curl -fL --retry 4 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js' -o leaflet.js
+
+          mkdir -p /tmp/abtraffic
+
+          # Find Alberta's newest published TCS dataset automatically.
+          YEAR=$(date -u +%Y)
+          FOUND=''
+          for y in $(seq "$YEAR" -1 $((YEAR-5))); do
+            if curl -fsSL --retry 2 "https://www.transportation.alberta.ca/mapping/${y}TCS.json" -o /tmp/abtraffic/tcs.json; then
+              FOUND="$y"
+              break
+            fi
+          done
+          if [ -z "$FOUND" ]; then
+            echo 'Could not locate a current Alberta TCS dataset.' >&2
+            exit 1
+          fi
+
+          curl -fL --retry 4 'https://www.transportation.alberta.ca/mapping/ATRPoints.xml' -o /tmp/abtraffic/atr.xml
+          curl -fL --retry 4 'https://www.transportation.alberta.ca/mapping/IntersectionPoints.xml' -o /tmp/abtraffic/intersections.xml
+
+          python3 - "$FOUND" <<'PY'
+          import json, html, sys, xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          year = int(sys.argv[1])
+          t0 = json.loads(Path('/tmp/abtraffic/tcs.json').read_text(encoding='utf-8-sig'))
+          t = [[x['id'], x['cs']['hwy'], x['cs']['cs'], x['tcs']['tcs'], x['tcs']['waadt'], x['tcs']['encodedPath']] for x in t0]
+
+          def points(path):
+              root = ET.fromstring(Path(path).read_text(encoding='utf-8-sig'))
+              out = []
+              for n in root.iter('pinfo'):
+                  out.append([
+                      html.unescape(n.attrib.get('refid','')),
+                      float(n.attrib['lat']),
+                      float(n.attrib['lng']),
+                      html.unescape(n.attrib.get('desc',''))
+                  ])
+              return out
+
+          a = points('/tmp/abtraffic/atr.xml')
+          i = points('/tmp/abtraffic/intersections.xml')
+          payload = json.dumps([t,a,i], separators=(',', ':'), ensure_ascii=False)
+          Path('data.js').write_text('window.AB_TRAFFIC_DATA=' + payload + ';\n', encoding='utf-8')
+          Path('meta.js').write_text(f'window.AB_TRAFFIC_YEAR={year};\n', encoding='utf-8')
+          print(f'Built source year {year}: {len(t)} TCS, {len(a)} ATR, {len(i)} intersections')
+          PY
+
+          touch .nojekyll
+
+      - name: Commit refreshed map
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add index.html leaflet.css leaflet.js data.js meta.js .nojekyll
+          if git diff --cached --quiet; then
+            echo 'No changes.'
+            exit 0
+          fi
+          git commit -m 'Refresh Alberta traffic map data'
+          git push
