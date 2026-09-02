@@ -93,3 +93,5 @@ jobs:
           fi
           git commit -m 'Refresh Alberta traffic map data'
           git push
+
+# This repository is the permanent home of the viewer.
